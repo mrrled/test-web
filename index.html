@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Spike B</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{color-scheme:light dark}
+body{font:15px/1.45 system-ui,sans-serif;max-width:640px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0 0 4px}
+.m{opacity:.65;font-size:13px;margin:0 0 14px}
+.c{border:1px solid #8884;border-radius:12px;padding:14px;margin-bottom:12px}
+.r{display:flex;gap:8px;flex-wrap:wrap;align-items:end}
+button,select{font:inherit;padding:10px 12px;border-radius:10px;border:1px solid #8886}
+button{flex:1;cursor:pointer}
+button:disabled{opacity:.45}
+.ly{display:grid;grid-template-columns:70px 1fr;gap:8px;align-items:center;margin:6px 0}
+#rs{display:none;width:100%;margin-top:10px;padding:16px;font-size:16px;background:#c2362b;color:#fff;border-color:#c2362b}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,Menlo,monospace}
+#log{max-height:260px;overflow:auto}
+textarea{width:100%;height:80px;box-sizing:border-box;font:11px ui-monospace,monospace;display:none;margin-top:8px}
+</style>
+</head>
+<body>
+<h1>Spike B</h1>
+<p class="m">&lt;audio&gt; для медитации + фоны в Web Audio (AudioBufferSource → Gain). Подготовить, Старт, погасить экран. Перед каждым новым прогоном лучше перезагрузить страницу.</p>
+
+<div class="c">
+  <div class="r">
+    <label>Длительность<br>
+      <select id="dur"><option value="2">2 мин (проба)</option><option value="30">30 мин</option><option value="60" selected>60 мин</option><option value="90">90 мин</option></select>
+    </label>
+    <label>Свой аудиофайл (необязательно)<br><input type="file" id="file" accept="audio/*"></label>
+  </div>
+  <div class="r" style="margin-top:10px">
+    <button id="prep">1. Подготовить</button>
+    <button id="go" disabled>2. Старт</button>
+    <button id="stop" disabled>Пауза</button>
+  </div>
+  <button id="rs">Звук прерван. Продолжить</button>
+</div>
+
+<div class="c">
+  <div>Статус: <b id="st">idle</b> · <span id="pos">0:00</span></div>
+  <div id="ly" style="margin-top:8px"></div>
+</div>
+
+<div class="c"><pre id="sum">Журнала пока нет.</pre></div>
+<div class="c"><pre id="log"></pre></div>
+
+<div class="c">
+  <div class="r"><button id="cp">Показать JSON</button><button id="clr">Очистить журнал</button></div>
+  <textarea id="out" readonly></textarea>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const LS='spike-b-log',SR=22050,LN=SR*8,NAMES=['Дождь','Лес','Дрон'];
+let log=[],T0=Date.now(),intent='pause',status='idle',started=false,endWall=0;
+let ctx=null,med=null,medUrl='',gains=[],nodes=[],layerData=[];
+let lastCur=0,lastAdv=Date.now(),lastTick=Date.now(),lastSave=0;
+
+/* ---------- генерация звука (файлы не нужны) ---------- */
+function wavHdr(sr,bits,n){const bl=bits/8,h=new DataView(new ArrayBuffer(44));const s=(o,t)=>[...t].forEach((c,i)=>h.setUint8(o+i,c.charCodeAt(0)));
+ s(0,'RIFF');h.setUint32(4,36+n*bl,true);s(8,'WAVEfmt ');h.setUint32(16,16,true);h.setUint16(20,1,true);h.setUint16(22,1,true);
+ h.setUint32(24,sr,true);h.setUint32(28,sr*bl,true);h.setUint16(32,bl,true);h.setUint16(34,bits,true);s(36,'data');h.setUint32(40,n*bl,true);return h.buffer}
+async function genMed(min){ // колокольчик каждые 5 с, гонг раз в минуту, 16 бит
+ const sr=8000,N=sr*5,TL=sr*6,M=sr*60,SC=[262,294,330,392,440,523,587];
+ const mk=(f,a,d)=>{const x=new Float32Array(TL);for(let i=0;i<TL;i++){const t=i/sr;x[i]=a*Math.exp(-t*d)*Math.min(1,t*100)*(Math.sin(6.283*f*t)+.4*Math.sin(6.283*f*2.76*t)*Math.exp(-t*2))}return x};
+ const T=SC.map(f=>mk(f,.32,.9)),G=mk(131,.5,.6),parts=[wavHdr(sr,16,M*min)];
+ for(let m=0;m<min;m++){const a=m*M,acc=new Float32Array(M);
+  for(let k=Math.floor((a-TL)/N)+1;k*N<a+M;k++){if(k<0)continue;const tp=k%12===0?G:T[(k*5+(k>>2))%7],st=k*N;
+   for(let j=Math.max(a,st);j<Math.min(a+M,st+TL);j++)acc[j-a]+=tp[j-st]}
+  const o=new Int16Array(M);for(let j=0;j<M;j++)o[j]=Math.max(-1,Math.min(1,acc[j]))*30000;parts.push(o);
+  $('prep').textContent='Генерация '+(m+1)+'/'+min;await new Promise(r=>setTimeout(r))}
+ return new Blob(parts,{type:'audio/wav'})}
+function genLayer(k){const a=new Float32Array(LN);let l=0;
+ for(let i=0;i<LN;i++){const w=Math.random()*2-1,t=i/SR;
+  if(k==0){l+=.3*(w-l);a[i]=l*.6}else if(k==1){l=(l+.02*w)/1.02;a[i]=l*3.5}else a[i]=.25*Math.sin(6.283*110*t)+.15*Math.sin(6.283*165*t)}
+ return a}
+
+/* ---------- журнал ---------- */
+const hms=s=>{s=Math.floor(s);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
+function add(ev,x){log.push({ev,t:new Date().toTimeString().slice(0,8),w:Math.round((Date.now()-T0)/1000),cur:med?+med.currentTime.toFixed(1):0,paused:med?med.paused:null,ctx:ctx?ctx.state:null,vis:document.visibilityState,...x});render();save()}
+function save(){try{localStorage.setItem(LS,JSON.stringify({T0,ua:navigator.userAgent,log}))}catch(_){}}
+function setStatus(s){if(s===status)return;status=s;$('st').textContent=s;$('rs').style.display=(intent==='play'&&s==='interrupted')?'block':'none'}
+function render(){
+ const x=log.filter(e=>e.ev==='interrupted'),g=log.filter(e=>e.ev==='gap'),p=log.filter(e=>e.ev==='pause-external');
+ $('sum').textContent=`Статус ${status} · позиция ${med?hms(med.currentTime):'0:00'}\nПрерываний: ${x.length} (первое на ${x[0]?x[0].cur+' с':'—'})\nВнешних пауз: ${p.length}\nДыр в журнале (>15 с): ${g.length}, макс. ${Math.max(0,...g.map(e=>e.sec||0))} с\nЗаписей: ${log.length}`;
+ const L=$('log');L.textContent=log.slice(-60).map(e=>`${e.t} +${e.w}s cur=${e.cur} ${e.ev} p=${e.paused} ctx=${e.ctx} ${e.vis}${e.src?' src='+e.src:''}${e.ok===false?' FAIL '+e.err:''}${e.sec?' gap='+e.sec+'s':''}${e.late!==undefined?' late='+e.late+'s':''}`).join('\n');L.scrollTop=L.scrollHeight}
+
+/* ---------- очистка прошлого прогона ---------- */
+function teardown(){
+ try{nodes.forEach(n=>{try{n.stop()}catch(_){}})}catch(_){}
+ try{if(med){med.onpause=med.onplay=med.onwaiting=med.onstalled=med.onended=med.onerror=null;med.pause();med.removeAttribute('src');med.load()}}catch(_){}
+ try{if(ctx){ctx.onstatechange=null;ctx.close()}}catch(_){}
+ ctx=null;gains=[];nodes=[];intent='pause';started=false}
+
+/* ---------- подготовка ---------- */
+$('prep').onclick=async()=>{
+ teardown();$('prep').disabled=true;$('go').disabled=true;$('prep').textContent='Подготовка…';await new Promise(r=>setTimeout(r,30));
+ if(medUrl)URL.revokeObjectURL(medUrl);
+ const f=$('file').files[0];
+ medUrl=URL.createObjectURL(f?f:await genMed(+$('dur').value));
+ med=new Audio();med.preload='auto';med.src=medUrl;
+ layerData=[0,1,2].map(genLayer);
+ med.onpause=()=>{if(mine){mine=false}else if(intent==='play'&&!med.ended)add('pause-external')};
+ med.onplay=()=>add('play');med.onwaiting=()=>add('waiting');med.onstalled=()=>add('stalled');
+ med.onended=()=>{intent='pause';setStatus('ended');stopLayers();add('ended',{late:Math.round((Date.now()-endWall)/1000)});$('go').disabled=true};
+ med.onerror=()=>{setStatus('error');add('error',{err:med.error&&med.error.code})};
+ await new Promise(r=>{med.oncanplaythrough=r;setTimeout(r,8000);med.load()});med.oncanplaythrough=null;
+ buildSliders();log=[];T0=Date.now();setStatus('ready');add('prepared',{file:f?f.name:'generated'});
+ $('prep').textContent='1. Подготовить заново';$('prep').disabled=false;$('go').disabled=false;$('stop').disabled=false};
+let mine=false;
+
+function buildSliders(){const w=$('ly');w.innerHTML='';
+ NAMES.forEach((n,i)=>{const d=document.createElement('div');d.className='ly';d.innerHTML=`<span>${n}</span><input type="range" min="0" max="100" value="${i==0?40:0}">`;
+  d.querySelector('input').oninput=e=>{if(gains[i])applyGain(i,e.target.value/100)};w.appendChild(d)})}
+const vol=i=>$('ly').querySelectorAll('input')[i].value/100;
+
+/* громкость + затухание за 5 с до конца: планируется на часах AudioContext */
+function applyGain(i,v,tc){const g=gains[i].gain,t=ctx.currentTime,rem=Math.max(0,(med.duration||0)-med.currentTime);
+ g.cancelScheduledValues(t);g.setTargetAtTime(v,t,tc||.05);
+ if(rem>6){g.setValueAtTime(v,t+rem-5);g.linearRampToValueAtTime(0,t+rem)}}
+function startLayers(){nodes.forEach(n=>{if(!n._on){n.start();n._on=true}});gains.forEach((_,i)=>applyGain(i,vol(i),.5))}
+function stopLayers(){try{nodes.forEach(n=>{try{n.stop()}catch(_){}});if(ctx)ctx.suspend()}catch(_){}add('layers-stopped')}
+
+function build(){
+ if('audioSession' in navigator){try{navigator.audioSession.type='playback'}catch(_){}}
+ ctx=new (window.AudioContext||window.webkitAudioContext)();ctx.onstatechange=()=>add('ctx-'+ctx.state);
+ layerData.forEach(f=>{const b=ctx.createBuffer(1,f.length,SR);b.copyToChannel(f,0);
+  const s=ctx.createBufferSource();s.buffer=b;s.loop=true;const g=ctx.createGain();g.gain.value=0;s.connect(g);g.connect(ctx.destination);gains.push(g);nodes.push(s)});
+ if('mediaSession' in navigator){
+  navigator.mediaSession.metadata=new MediaMetadata({title:'Spike B',artist:'Тест'});
+  navigator.mediaSession.setActionHandler('play',()=>{add('ms-play');intent='play';resume(true)});
+  navigator.mediaSession.setActionHandler('pause',()=>{add('ms-pause');pause('mediasession')})}
+ started=true}
+
+/* ---------- управление ---------- */
+$('go').onclick=async()=>{
+ intent='play';
+ try{
+  if(!started)build();
+  if(ctx.state!=='running')await ctx.resume();
+  await med.play();startLayers();
+  endWall=Date.now()+Math.max(0,(med.duration-med.currentTime))*1000;
+  lastCur=med.currentTime;lastAdv=Date.now();setStatus('playing');add('start',{ok:true})
+ }catch(e){setStatus('error');add('start',{ok:false,err:e.name+': '+e.message})}};
+function pause(src){intent='pause';mine=true;med.pause();if(ctx)ctx.suspend();setStatus('paused');add('pause-own',{src:src||'?'})}
+$('stop').onclick=()=>{if(med)pause('button')};
+async function resume(manual){const k=manual?'manual-resume':'auto-resume';
+ try{if(ctx&&ctx.state!=='running')await ctx.resume();await med.play();startLayers();lastAdv=Date.now();lastCur=med.currentTime;add(k,{ok:true})}
+ catch(e){add(k,{ok:false,err:e.name})}}
+$('rs').onclick=()=>{intent='play';resume(true)};
+
+try{navigator.mediaDevices.addEventListener('devicechange',()=>add('devicechange'))}catch(_){}
+document.addEventListener('visibilitychange',()=>{add('visibility');
+ if(document.visibilityState==='visible'&&intent==='play'&&med&&(med.paused||(ctx&&ctx.state!=='running')))resume(false)});
+
+/* watchdog + дыры в журнале */
+setInterval(()=>{
+ if(!med)return;const now=Date.now(),gap=Math.round((now-lastTick)/1000);lastTick=now;
+ $('pos').textContent=hms(med.currentTime)+' / '+hms(med.duration||0);
+ if(gap>15)add('gap',{sec:gap});
+ if(intent!=='play')return;
+ if(med.currentTime>lastCur+.2){lastCur=med.currentTime;lastAdv=now;if(status==='interrupted'){setStatus('playing');add('recovered')}}
+ else if(now-lastAdv>8000&&status==='playing'){setStatus('interrupted');add('interrupted')}
+ if(now-lastSave>5000){lastSave=now;add('tick')}
+},1000);
+
+$('cp').onclick=()=>{const o=$('out');o.style.display='block';o.value=JSON.stringify({cfg:'B',ua:navigator.userAgent,summary:$('sum').textContent,log});o.select();try{navigator.clipboard.writeText(o.value)}catch(_){}};
+$('clr').onclick=()=>{log=[];T0=Date.now();try{localStorage.removeItem(LS)}catch(_){}render()};
+
+try{const s=JSON.parse(localStorage.getItem(LS)||'null');if(s&&s.log&&s.log.length){log=s.log;T0=s.T0;
+ log.push({ev:'PAGE-RELOADED (вкладка могла быть убита)',t:new Date().toTimeString().slice(0,8),w:Math.round((Date.now()-T0)/1000),cur:0,paused:null,ctx:null,vis:document.visibilityState});render()}}catch(_){}
+</script>
+</body>
+</html>
